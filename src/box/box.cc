@@ -79,6 +79,12 @@ static void title(const char *new_status)
 
 bool box_snapshot_is_in_progress = false;
 bool box_backup_is_in_progress = false;
+
+/*
+ * vclock of the checkpoint that is currently being backed up.
+ */
+static struct vclock box_backup_vclock;
+
 /**
  * The instance is in read-write mode: the local checkpoint
  * and all write ahead logs are processed. For a replica,
@@ -112,6 +118,41 @@ static struct fiber_pool tx_fiber_pool;
  * are too many messages in flight (gh-1892).
  */
 static struct cbus_endpoint tx_prio_endpoint;
+
+/** Garbage collection state. */
+struct box_gc_state {
+	/** Max LSN box_gc() has been called for. */
+	int64_t lsn;
+	/**
+	 * vclocks of checkpoints that are still in use and
+	 * therefore must not be deleted by box_gc(), see
+	 * box_gc_node.
+	 */
+	vclockset_t pinned;
+};
+static struct box_gc_state box_gc_state;
+
+/**
+ * This structure represents a checkpoint that is still in use
+ * (e.g. needed for ongoing replication or backup).
+ *
+ * If an object of this type is linked in box_gc_state::pinned via
+ * box_gc_node::vclock, files that are needed to recover from a
+ * checkpoint having signature box_gc_state::vclock or newer won't
+ * be removed during garbage collection.
+ */
+struct box_gc_node {
+	/**
+	 * vclock of the pinned checkpoint.
+	 * Linked in box_gc_state::pinned.
+	 */
+	struct vclock vclock;
+	/**
+	 * Number of users of the pinned checkpoint.
+	 * Once it drops to 0, the node is deleted.
+	 */
+	int refs;
+};
 
 static void
 box_check_writable(void)
@@ -1498,9 +1539,17 @@ tx_prio_cb(struct ev_loop *loop, ev_watcher *watcher, int events)
 	cbus_process(endpoint);
 }
 
+static void
+box_gc_init(void)
+{
+	vclockset_new(&box_gc_state.pinned);
+}
+
 int
 box_init(void)
 {
+	box_gc_init();
+
 	user_cache_init();
 	/*
 	 * The order is important: to initialize sessions,
@@ -1731,11 +1780,114 @@ end:
 	return rc;
 }
 
-void
-box_gc(int64_t lsn)
+/*
+ * Remove files that are not needed to recover from
+ * a checkpoint with the given lsn or newer.
+ */
+static void
+box_gc_run(int64_t lsn)
 {
 	wal_collect_garbage(lsn);
 	engine_collect_garbage(lsn);
+}
+
+/**
+ * Pin files created at >= @vclock so that they can't be removed by
+ * garbage collection. To revert the effect of this function use
+ * box_gc_unpin().
+ *
+ * This function may fail due to lack of memory, in which case
+ * it returns -1.
+ */
+static int
+box_gc_pin(struct vclock *vclock)
+{
+	assert(vclock_sum(vclock) >= box_gc_state.lsn);
+
+	struct vclock *match;
+	match = vclockset_search(&box_gc_state.pinned, vclock);
+
+	struct box_gc_node *node;
+	if (match == NULL) {
+		node = (struct box_gc_node *) malloc(sizeof(*node));
+		if (node == NULL) {
+			diag_set(OutOfMemory, sizeof(*node),
+				  "malloc", "struct box_gc_node");
+			return -1;
+		}
+		vclock_copy(&node->vclock, vclock);
+		node->refs = 1;
+		vclockset_insert(&box_gc_state.pinned, &node->vclock);
+	} else {
+		node = container_of(match, struct box_gc_node, vclock);
+		node->refs++;
+	}
+	return 0;
+}
+
+/**
+ * Revert the effect of box_gc_pin().
+ *
+ * To make files removable again, this function must be eventually
+ * called per each call of box_gc_pin() with exactly the same vclock.
+ */
+static void
+box_gc_unpin(struct vclock *vclock)
+{
+	struct vclock *match;
+	match = vclockset_search(&box_gc_state.pinned, vclock);
+	assert(match != NULL);
+
+	struct box_gc_node *node;
+	node = container_of(match, struct box_gc_node, vclock);
+
+	assert(node->refs > 0);
+	if (--node->refs > 0)
+		return; /* checkpoint is still in use */
+
+	/*
+	 * When the oldest checkpoint is unpinned, we need
+	 * to retry garbage collection if box_gc() has been
+	 * called for a greater lsn.
+	 */
+	bool call_gc = false;
+	if (box_gc_state.lsn > vclock_sum(&node->vclock) &&
+	    &node->vclock == vclockset_first(&box_gc_state.pinned))
+		call_gc = true;
+
+	vclockset_remove(&box_gc_state.pinned, &node->vclock);
+	free(node);
+
+	if (!call_gc)
+		return;
+
+	int64_t lsn = box_gc_state.lsn;
+	struct vclock *pinned = vclockset_first(&box_gc_state.pinned);
+	if (pinned != NULL)
+		lsn = MIN(vclock_sum(pinned), lsn);
+
+	box_gc_run(lsn);
+}
+
+void
+box_gc(int64_t lsn)
+{
+	/*
+	 * Do not allow to remove the last checkpoint,
+	 * because we need it for recovery.
+	 */
+	struct vclock last_checkpoint;
+	recovery_last_checkpoint(&last_checkpoint);
+	lsn = MIN(vclock_sum(&last_checkpoint), lsn);
+
+	if (box_gc_state.lsn < lsn)
+		box_gc_state.lsn = lsn;
+
+	struct vclock *pinned = vclockset_first(&box_gc_state.pinned);
+	if (pinned != NULL)
+		lsn = MIN(vclock_sum(pinned), lsn);
+
+	box_gc_run(lsn);
 }
 
 int
@@ -1745,21 +1897,28 @@ box_backup_start(box_backup_cb cb, void *cb_arg)
 		diag_set(ClientError, ER_BACKUP_IN_PROGRESS);
 		return -1;
 	}
-	struct vclock vclock;
-	if (recovery_last_checkpoint(&vclock) < 0) {
+	if (recovery_last_checkpoint(&box_backup_vclock) < 0) {
 		diag_set(ClientError, ER_MISSING_SNAPSHOT);
 		return -1;
 	}
-	int rc = engine_backup(&vclock, cb, cb_arg);
-	if (rc == 0)
-		box_backup_is_in_progress = true;
+	if (box_gc_pin(&box_backup_vclock))
+		return -1;
+	box_backup_is_in_progress = true;
+	int rc = engine_backup(&box_backup_vclock, cb, cb_arg);
+	if (rc != 0) {
+		box_gc_unpin(&box_backup_vclock);
+		box_backup_is_in_progress = false;
+	}
 	return rc;
 }
 
 void
 box_backup_stop(void)
 {
-	box_backup_is_in_progress = false;
+	if (box_backup_is_in_progress) {
+		box_gc_unpin(&box_backup_vclock);
+		box_backup_is_in_progress = false;
+	}
 }
 
 const char *
