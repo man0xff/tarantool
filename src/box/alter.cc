@@ -46,6 +46,7 @@
 #include "session.h" /* to fetch the current user. */
 #include "vclock.h" /* VCLOCK_MAX */
 #include "memtx_tuple.h"
+#include "salad/rtree.h" /* RTREE_MAX_DIMENSION */
 
 /** _space columns */
 #define ID               0
@@ -341,61 +342,124 @@ const char *mp_map_find(const char *parse_pos, const char *key,
 	return res;
 }
 
-/**
- * Populate key options from their msgpack-encoded representation
- * (msgpack map)
- *
- * @return   the end of the msgpack map in the stream
- */
-static const char *
-opts_create_from_field(void *opts, const struct opt_def *reg, const char *map,
-		       uint32_t errcode, uint32_t field_no)
+struct opt_parser {
+	uint32_t error_code;
+	uint32_t field_no;
+	struct mp_map_iterator map_iter;
+};
+
+void opt_parser_init(struct opt_parser *parser, const char *p,
+		     uint32_t error_code, uint32_t field_no)
+{
+	parser->error_code = error_code;
+	parser->field_no = field_no;
+	mp_map_iterator_init(&parser->map_iter, p);
+}
+
+int opt_parser_next(struct opt_parser *parser)
+{
+	if (mp_map_iterator_next(&parser->map_iter) == NULL) return -1;
+	return parser->map_iter.cur_key[0];
+}
+
+bool opt_parser_at_key(struct opt_parser *parser, const char *key)
+{
+	return mp_map_iterator_at_key(&parser->map_iter, key);
+}
+
+static
+void opt_parser_wrong_type(struct opt_parser *parser, const char *expected)
 {
 	char errmsg[DIAG_ERRMSG_MAX];
+	snprintf(errmsg, sizeof(errmsg),
+		 "'%.*s' must be %s",
+		 parser->map_iter.cur_key_length, parser->map_iter.cur_key,
+		 expected
+	);
+	tnt_raise(ClientError, parser->error_code, parser->field_no,
+		  errmsg);
+}
 
-	if (mp_typeof(*map) == MP_NIL)
-		return map;
-	if (mp_typeof(*map) != MP_MAP)
-		tnt_raise(ClientError, errcode, field_no,
-			  "expected a map with options");
+void opt_parser_unexpected(struct opt_parser *parser)
+{
+	char errmsg[DIAG_ERRMSG_MAX];
+	snprintf(errmsg, sizeof(errmsg),
+		 "unexpected option '%.*s'",
+		 parser->map_iter.cur_key_length, parser->map_iter.cur_key
+	);
+	tnt_raise(ClientError, parser->error_code, parser->field_no,
+		  errmsg);
+}
 
-	/*
-	 * The implementation below has O(map_size * reg_size) complexity.
-	 * DDL is not performance-critical, so this is not a problem.
-	 */
-	uint32_t map_size = mp_decode_map(&map);
-	for (uint32_t i = 0; i < map_size; i++) {
-		if (mp_typeof(*map) != MP_STR) {
-			tnt_raise(ClientError, errcode, field_no,
-				  "key must be a string");
-		}
-		uint32_t key_len;
-		const char *key = mp_decode_str(&map, &key_len);
-		bool found = false;
-		for (const struct opt_def *def = reg; def->name != NULL; def++) {
-			if (key_len != strlen(def->name) ||
-			    memcmp(key, def->name, key_len) != 0)
-				continue;
-
-			if (opt_set(opts, def, &map) != 0) {
-				snprintf(errmsg, sizeof(errmsg),
-					"'%.*s' must be %s", key_len, key,
-					opt_type_strs[def->type]);
-				tnt_raise(ClientError, errcode, field_no,
-					  errmsg);
-			}
-
-			found = true;
-			break;
-		}
-		if (!found) {
-			snprintf(errmsg, sizeof(errmsg),
-				"unexpected option '%.*s'",
-				key_len, key);
-			tnt_raise(ClientError, errcode, field_no, errmsg);
-		}
+CFORMAT(printf, 2, 3)
+void opt_parser_bad_value(struct opt_parser *parser, const char *fmt, ...)
+{
+	char errmsg[DIAG_ERRMSG_MAX];
+	int n = snprintf(errmsg, sizeof(errmsg), "%.*s",
+			 parser->map_iter.cur_key_length,
+			 parser->map_iter.cur_key);
+	if (n > 0 && (size_t)n < DIAG_ERRMSG_MAX) {
+		va_list ap;
+		va_start(ap, fmt);
+		vsnprintf(errmsg + n, sizeof(errmsg) - n, fmt, ap);
 	}
-	return map;
+	tnt_raise(ClientError, parser->error_code, parser->field_no,
+		  errmsg);
+}
+
+bool opt_parser_read_bool(struct opt_parser *parser)
+{
+	const char *p = parser->map_iter.cur_value;
+	if (mp_typeof(*p) != MP_BOOL)
+		opt_parser_wrong_type(parser, "boolean");
+	return mp_decode_bool(&p);
+}
+
+const char *
+opt_parser_read_str(struct opt_parser *parser, uint32_t *length)
+{
+	const char *p = parser->map_iter.cur_value;
+	if (mp_typeof(*p) != MP_STR)
+		opt_parser_wrong_type(parser, "string");
+	*length = mp_decode_strl(&p);
+	return p;
+}
+
+int64_t opt_parser_read_int64(struct opt_parser *parser)
+{
+	const char *p = parser->map_iter.cur_value;
+	int64_t res;
+	if (mp_read_int64(&p, &res) != 0)
+		opt_parser_wrong_type(parser, "integer");
+	return res;
+}
+
+double opt_parser_read_double(struct opt_parser *parser)
+{
+	const char *p = parser->map_iter.cur_value;
+	double res;
+	if (mp_read_double(&p, &res) != 0)
+		opt_parser_wrong_type(parser, "double");
+	return res;
+}
+
+void
+opt_parser_read_fixstr(struct opt_parser *parser, char *buf, size_t buf_length)
+{
+	uint32_t length;
+	const char *str = opt_parser_read_str(parser, &length);
+	if (length >= buf_length) {
+		char errmsg[DIAG_ERRMSG_MAX];
+		snprintf(errmsg, sizeof(errmsg),
+			"'%.*s' exceeds max length (%zu)",
+			parser->map_iter.cur_key_length,
+			parser->map_iter.cur_key,
+			buf_length - 1
+		);
+		tnt_raise(ClientError, parser->error_code, parser->field_no,
+			  errmsg);
+	}
+	memcpy(buf, str, length); buf[length] = '\0';
 }
 
 /**
@@ -405,23 +469,19 @@ opts_create_from_field(void *opts, const struct opt_def *reg, const char *map,
  * Does not check message type, MP_STRING expected
  * Throws an error if the the value does not correspond to any enum value
  */
-static enum rtree_index_distance_type
-key_opts_decode_distance(const char *str)
+static bool
+key_opts_decode_distance(const char *str,
+			 enum rtree_index_distance_type *type)
 {
-	uint32_t len = strlen(str);
-	if (len == strlen("euclid") &&
-	    strncasecmp(str, "euclid", len) == 0) {
-		return RTREE_INDEX_DISTANCE_TYPE_EUCLID;
-	} else if (len == strlen("manhattan") &&
-		   strncasecmp(str, "manhattan", len) == 0) {
-		return RTREE_INDEX_DISTANCE_TYPE_MANHATTAN;
+	if (strcasecmp(str, "euclid") == 0) {
+		*type = RTREE_INDEX_DISTANCE_TYPE_EUCLID;
+		return true;
+	} else if (strcasecmp(str, "manhattan") == 0) {
+		*type = RTREE_INDEX_DISTANCE_TYPE_MANHATTAN;
+		return true;
 	} else {
-		tnt_raise(ClientError,
-			  ER_WRONG_INDEX_OPTIONS,
-			  INDEX_OPTS,
-			  "distance must be either 'euclid' or 'manhattan'");
+		return false;
 	}
-	return RTREE_INDEX_DISTANCE_TYPE_EUCLID; /* unreachabe */
 }
 
 /**
@@ -435,18 +495,90 @@ key_opts_decode_distance(const char *str)
 static const char *
 key_opts_create(struct key_opts *opts, const char *map)
 {
+	int k;
+	opt_parser p;
+	opt_parser_init(&p, map, ER_WRONG_INDEX_OPTIONS, INDEX_OPTS);
+
 	*opts = key_opts_default;
-	map = opts_create_from_field(opts, key_opts_reg, map,
-				     ER_WRONG_INDEX_OPTIONS, INDEX_OPTS);
-	if (opts->distancebuf[0] != '\0')
-		opts->distance = key_opts_decode_distance(opts->distancebuf);
-	if (opts->run_count_per_level <= 0)
-		tnt_raise(ClientError, ER_WRONG_INDEX_OPTIONS, INDEX_OPTS,
-			  "run_count_per_level must be > 0");
-	if (opts->run_size_ratio <= 1)
-		tnt_raise(ClientError, ER_WRONG_SPACE_OPTIONS, INDEX_OPTS,
-			  "run_size_ratio must be > 1");
-	return map;
+
+	while ((k = opt_parser_next(&p)) != -1) {
+		switch (k) {
+		case 'd':
+			if (opt_parser_at_key(&p, "dimension")) {
+				opts->dimension = opt_parser_read_int64(&p);
+				if (opts->dimension < 1 ||
+				    opts->dimension > RTREE_MAX_DIMENSION) {
+					opt_parser_bad_value(
+						&p,
+						": valid range is [1..%d]",
+						RTREE_MAX_DIMENSION
+					);
+				}
+				continue;
+			}
+			if (opt_parser_at_key(&p, "distance")) {
+				char buf[16];
+				opt_parser_read_fixstr(&p, buf, sizeof(buf));
+				if (!key_opts_decode_distance(buf,
+							      &opts->distance)) {
+					opt_parser_bad_value(
+						&p,
+						" must be either 'euclid' "
+						"or 'manhattan'"
+					);
+				}
+				continue;
+			}
+			break;
+		case 'l':
+			if (opt_parser_at_key(&p, "lsn")) {
+				opts->lsn = opt_parser_read_int64(&p);
+				continue;
+			}
+			break;
+		case 'p':
+			if (opt_parser_at_key(&p, "page_size")) {
+				opts->page_size = opt_parser_read_int64(&p);
+				continue;
+			}
+			if (opt_parser_at_key(&p, "path")) {
+				opt_parser_read_fixstr(&p, opts->path,
+						       sizeof(opts->path));
+				continue;
+			}
+			break;
+		case 'r':
+			if (opt_parser_at_key(&p, "range_size")) {
+				opts->range_size = opt_parser_read_int64(&p);
+				continue;
+			}
+			if (opt_parser_at_key(&p, "run_count_per_level")) {
+				opts->run_count_per_level =
+					opt_parser_read_int64(&p);
+				if (opts->run_count_per_level <= 0)
+					opt_parser_bad_value(&p,
+							     " must be > 0");
+				continue;
+			}
+			if (opt_parser_at_key(&p, "run_size_ratio")) {
+				opts->run_size_ratio =
+					opt_parser_read_double(&p);
+				if (opts->run_size_ratio <= 1)
+					opt_parser_bad_value(&p,
+							     " must be > 1");
+				continue;
+			}
+			break;
+		case 'u':
+			if (opt_parser_at_key(&p, "unique")) {
+				opts->is_unique = opt_parser_read_bool(&p);
+				continue;
+			}
+			break;
+		}
+		opt_parser_unexpected(&p);
+	}
+	return p.map_iter.parse_pos;
 }
 
 /**
@@ -680,8 +812,22 @@ space_opts_create(struct space_opts *opts, struct tuple *tuple)
 				flags++;
 		}
 	} else {
-		opts_create_from_field(opts, space_opts_reg, data,
-				       ER_WRONG_SPACE_OPTIONS, OPTS);
+		int k;
+		opt_parser p;
+		opt_parser_init(&p, data, ER_WRONG_SPACE_OPTIONS, OPTS);
+
+		while ((k = opt_parser_next(&p)) != -1) {
+			switch (k) {
+			case 't':
+				if (opt_parser_at_key(&p, "temporary")) {
+					opts->temporary =
+						opt_parser_read_bool(&p);
+					continue;
+				}
+				break;
+			}
+			opt_parser_unexpected(&p);
+		}
 	}
 }
 

@@ -133,26 +133,6 @@ enum index_type {
 
 extern const char *index_type_strs[];
 
-enum opt_type {
-	OPT_BOOL,	/* bool */
-	OPT_INT,	/* int64_t */
-	OPT_FLOAT,	/* double */
-	OPT_STR,	/* char[] */
-	opt_type_MAX,
-};
-
-extern const char *opt_type_strs[];
-
-struct opt_def {
-	const char *name;
-	enum opt_type type;
-	ptrdiff_t offset;
-	uint32_t len;
-};
-
-#define OPT_DEF(key, type, opts, field) \
-	{ key, type, offsetof(opts, field), sizeof(((opts *)0)->field) }
-
 enum rtree_index_distance_type {
 	 /* Euclid distance, sqrt(dx*dx + dy*dy) */
 	RTREE_INDEX_DISTANCE_TYPE_EUCLID,
@@ -176,14 +156,13 @@ struct key_opts {
 	 */
 	bool is_unique;
 	/**
+	 * RTREE distance type.
+	 */
+	enum rtree_index_distance_type distance;
+	/**
 	 * RTREE index dimension.
 	 */
 	int64_t dimension;
-	/**
-	 * RTREE distance type.
-	 */
-	char distancebuf[16];
-	enum rtree_index_distance_type distance;
 	/**
 	 * Vinyl index options.
 	 */
@@ -208,7 +187,6 @@ struct key_opts {
 };
 
 extern const struct key_opts key_opts_default;
-extern const struct opt_def key_opts_reg[];
 
 static inline int
 key_opts_cmp(const struct key_opts *o1, const struct key_opts *o2)
@@ -356,7 +334,6 @@ struct space_opts {
 };
 
 extern const struct space_opts space_opts_default;
-extern const struct opt_def space_opts_reg[];
 
 /** Space metadata. */
 struct space_def {
