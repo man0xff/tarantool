@@ -243,6 +243,105 @@ opt_set(void *opts, const struct opt_def *def, const char **val)
 }
 
 /**
+ * This object is used to enumerate items in a MsgPack-encoded map.
+ * See: mp_map_iterator_init(), mp_map_iterator_next()
+ */
+struct mp_map_iterator {
+	const char *parse_pos;
+	const char *cur_key; /* points to character data, lacks NUL-term */
+	const char *cur_value;
+	uint32_t    kv_pairs_left;
+	uint32_t    cur_key_length;
+};
+
+/**
+ * Init map iterator. If the object isn't actually a map, behave as if
+ * it was an empty map.
+ */
+void mp_map_iterator_init(struct mp_map_iterator *mi,
+	                  const char *p)
+{
+	if (mp_typeof(*p) == MP_MAP) {
+		mi->kv_pairs_left = mp_decode_map(&p);
+	} else {
+		/* Not a map — skip it. */
+		mi->kv_pairs_left = 0;
+		mp_next(&p);
+	}
+	mi->parse_pos = p;
+}
+
+/**
+ * Advance the iterator, return next value or NULL if the iterator
+ * reached the end of map. To examine the key, consult
+ * cur_key / cur_key_length fields in the iterator or use
+ * mp_map_iterator_at_key() convenience function.
+ *
+ * Iterator skips non-string keys. If mp_map_iterator_next() returned
+ * NULL, parse_pos field contains a pointer to the next element
+ * following the map.
+ */
+const char *mp_map_iterator_next(struct mp_map_iterator *mi)
+{
+	const char *cur_value;
+	if (mi->kv_pairs_left == 0) {
+                return mi->cur_value = NULL;
+        }
+	mi->kv_pairs_left --;
+	if (mp_typeof(*mi->parse_pos) != MP_STR) {
+		/* Non-string keys are effectively invisible. */
+		mp_next(&mi->parse_pos);
+		mp_next(&mi->parse_pos);
+		return mp_map_iterator_next(mi);
+	}
+	mi->cur_key_length = mp_decode_strl(&mi->parse_pos);
+	/* Enable the caller to examine cur_key[0] safely. */
+	mi->cur_key = mi->cur_key_length != 0 ? mi->parse_pos : "";
+	cur_value = mi->parse_pos += mi->cur_key_length;
+	mp_next(&mi->parse_pos);
+	return mi->cur_value = cur_value;
+}
+
+/**
+ * Check if the iterator is currently positioned at the key.
+ */
+bool mp_map_iterator_at_key(struct mp_map_iterator *mi, const char *key)
+{
+	/*
+	 * Cur_key lacks a NUL-terminator, hence strncmp.
+	 * If strncmp returned 0, two strings were equal up to
+	 * cur_key_length. There's a chance that cur_key is a PREFIX of
+	 * the key, ex: "foo" vs. "foobar", hence the check that the key
+	 * actually ends after cur_key_length bytes.
+	 */
+	return strncmp(key, mi->cur_key, mi->cur_key_length) == 0 &&
+	       key[mi->cur_key_length] == 0;
+}
+
+/**
+ * Locate a key by name in a map and return a pointer to the value,
+ * or NULL if not found.  Function writes a pointer to the next element
+ * following the map in pnext.  A caller MAY pass NULL instead of pnext
+ * if she doesn't need this information.
+ *
+ * If a map contains duplicate keys, mp_map_find() returns the last one.
+ */
+const char *mp_map_find(const char *parse_pos, const char *key,
+			const char **pnext)
+{
+	const char *res = NULL, *p;
+	mp_map_iterator mi;
+	mp_map_iterator_init(&mi, parse_pos);
+        /* In case of duplicate keys, the last value "wins". */
+	while ((p = mp_map_iterator_next(&mi)) != NULL) {
+		if (mi.cur_key[0] == key[0] &&
+		    mp_map_iterator_at_key(&mi, key)) res = p;
+	}
+	if (pnext) *pnext = mi.parse_pos;
+	return res;
+}
+
+/**
  * Populate key options from their msgpack-encoded representation
  * (msgpack map)
  *
@@ -488,93 +587,6 @@ key_def_new_from_tuple(struct tuple *tuple)
 	return key_def;
 }
 
-static char *
-opt_encode(char *data, char *data_end, const void *opts,
-	   const void *default_opts, const struct opt_def *def)
-{
-	int64_t ival;
-	double dval;
-	const char *opt = ((const char *) opts) + def->offset;
-	const char *default_opt = ((const char *) default_opts) + def->offset;
-	if (memcmp(opt, default_opt, def->len) == 0)
-		return data;
-	uint32_t optlen = strlen(def->name);
-	if (data + mp_sizeof_str(optlen) > data_end)
-		return data_end;
-	data = mp_encode_str(data, def->name, optlen);
-	switch (def->type) {
-	case OPT_BOOL:
-		if (data + mp_sizeof_bool(true) > data_end)
-			return data_end;
-		data = mp_encode_bool(data, load_bool(opt));
-		break;
-	case OPT_INT:
-		ival = load_u64(opt);
-		if ((ival < 0 && data + mp_sizeof_int(ival) > data_end) ||
-		    (ival >= 0 && data + mp_sizeof_uint(ival) > data_end))
-			return data_end;
-		if (ival < 0)
-			data = mp_encode_int(data, ival);
-		else
-			data = mp_encode_uint(data, ival);
-		break;
-	case OPT_FLOAT:
-		dval = load_double(opt);
-		if (data + mp_sizeof_double(dval) > data_end)
-			return data_end;
-		data = mp_encode_double(data, dval);
-		break;
-	case OPT_STR:
-		optlen = strlen(opt);
-		if (data + mp_sizeof_str(optlen) > data_end)
-			return data_end;
-		data = mp_encode_str(data, opt, optlen);
-		break;
-	default:
-		unreachable();
-	}
-	return data;
-}
-
-static char *
-opts_encode(char *data, char *data_end, const void *opts,
-	    const void *default_opts, const struct opt_def *reg)
-{
-	char *p = data;
-	uint32_t n_opts = 0;
-	for (const struct opt_def *def = reg; def->name != NULL; def++) {
-		char *end = opt_encode(p, data_end, opts, default_opts, def);
-		if (end == data_end)
-			return end;
-		if (p != end) {
-			p = end;
-			n_opts++;
-		}
-	}
-	ptrdiff_t len = p - data;
-	if (data + mp_sizeof_map(n_opts) > data_end)
-		return data_end;
-	memmove(data + mp_sizeof_map(n_opts), data, len);
-	data = mp_encode_map(data, n_opts);
-	data += len;
-	return data;
-}
-
-
-/**
- * Encode options key_opts into msgpack stream.
- * @pre output buffer is reserved to contain enough space for the
- * output.
- *
- * @return a pointer to the end of the stream.
- */
-static char *
-key_opts_encode(char *data, char *data_end, const struct key_opts *opts)
-{
-	return opts_encode(data, data_end, opts, &key_opts_default,
-			   key_opts_reg);
-}
-
 struct tuple *
 key_def_tuple_update_lsn(struct tuple *tuple, int64_t lsn)
 {
@@ -582,15 +594,18 @@ key_def_tuple_update_lsn(struct tuple *tuple, int64_t lsn)
 	key_def_check_tuple(tuple, &is_166plus);
 	if (!is_166plus)
 		return tuple;
-	struct key_opts opts;
-	const char *opts_field = tuple_field(tuple, INDEX_OPTS);
-	const char *opts_field_end = key_opts_create(&opts, opts_field);
-	opts.lsn = lsn;
-	size_t size = (opts_field_end - opts_field) + 64;
+
+	const char *opts = tuple_field(tuple, INDEX_OPTS);
+	const char *opts_end;
+	const char *lsn_value = mp_map_find(opts, "lsn", &opts_end);
+	size_t size = (opts_end - opts) + 64;
+
 	char *buf = (char *)malloc(size);
 	if (buf == NULL)
 		tnt_raise(OutOfMemory, size, "malloc", "buf");
 	char *buf_end = buf;
+
+	/* Encode UPDATE statement. */
 	buf_end = mp_encode_array(buf_end, 2);
 	buf_end = mp_encode_array(buf_end, 3);
 	buf_end = mp_encode_str(buf_end, "#", 1);
@@ -599,8 +614,35 @@ key_def_tuple_update_lsn(struct tuple *tuple, int64_t lsn)
 	buf_end = mp_encode_array(buf_end, 3);
 	buf_end = mp_encode_str(buf_end, "!", 1);
 	buf_end = mp_encode_uint(buf_end, INDEX_OPTS + 1);
-	buf_end = key_opts_encode(buf_end, buf + size, &opts);
-	/* No check of return value: buf is checked by box_tuple_update */
+
+	/* Now comes the payload - the options MAP. */
+	if (lsn_value == NULL) {
+		/* LSN key was absent, add one and increase MAP length. */
+		uint32_t opts_length = mp_decode_map(&opts);
+		buf_end = mp_encode_map(buf_end, opts_length + 1);
+		memcpy(buf_end, opts, opts_end - opts);
+		buf_end += opts_end - opts;
+		buf_end = mp_encode_str(buf_end, "lsn", 3);
+	} else {
+		/* Copy everything up to LSN key. */
+		memcpy(buf_end, opts, lsn_value - opts);
+		buf_end += lsn_value - opts;
+		mp_next(&lsn_value);
+	}
+
+	/* Encode LSN. */
+	if (lsn > 0) {
+		buf_end = mp_encode_uint(buf_end, lsn);
+	} else {
+		buf_end = mp_encode_int(buf_end, lsn);
+	}
+
+	if (lsn_value != NULL) {
+		/* Copy the tail following LSN key. */
+		memcpy(buf_end, lsn_value, opts_end - lsn_value);
+		buf_end += opts_end - lsn_value;
+	}
+
 	assert(buf_end < buf + size);
 	tuple = box_tuple_update(tuple, buf, buf_end);
 	free(buf);

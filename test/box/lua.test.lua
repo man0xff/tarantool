@@ -284,5 +284,26 @@ index_random_test(space, 'secondary')
 space:drop()
 space = nil
 
+-- #2060 Truncate removes "unique" field in index ops
+-- This test checks that "opts" stay the same after truncate.
+space = box.schema.space.create('tweedledum', { id = 900100 })
+-- Remove LSN values from the output
+test_run:cmd("push filter '.lsn.: \\d+' to '<LSN>' ")
+-- Both unique=true and unique=false must be preserved (even though unique=true is the default)
+_ = space:create_index('primary', { type = 'tree', parts = {1, 'unsigned'}, unique = true })
+_ = space:create_index('secondary', { type = 'tree', parts = {1, 'unsigned'}, unique = false })
+-- Even the most obscure non-sensical options must be preserved (and this one lacks LSN initially)
+_ = box.space._index:insert({space.id, 100, 'tertiary', 'tree', {page_size=42}, {{0,"unsigned"}}})
+-- What if options were empty?
+_ = box.space._index:insert({space.id, 101, 'quaternary', 'tree', require('json').decode('{}'), {{0,"unsigned"}}})
+pre = box.space._index:select({space.id}); return pre
+space:truncate()
+post = box.space._index:select({space.id}); return post
+-- Make sure LSN was updated
+pre[1][5].lsn < post[1][5].lsn
+pre[2][5].lsn < post[2][5].lsn
+
+space:drop()
+
 test_run:cmd("clear filter")
 -- vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4
