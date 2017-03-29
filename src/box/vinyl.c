@@ -77,7 +77,7 @@
 #include "fio.h"
 #include "space.h"
 #include "index.h"
-#include "xctl.h"
+#include "vy_log.h"
 #include "xstream.h"
 
 #include "request.h"
@@ -1571,12 +1571,12 @@ static int
 vy_range_prepare_new_run(struct vy_range *range)
 {
 	struct vy_index *index = range->index;
-	struct vy_run *run = vy_run_new(xctl_next_vy_run_id());
+	struct vy_run *run = vy_run_new(vy_log_next_run_id());
 	if (run == NULL)
 		return -1;
-	xctl_tx_begin();
-	xctl_prepare_vy_run(index->index_def->opts.lsn, run->id);
-	if (xctl_tx_commit() < 0) {
+	vy_log_tx_begin();
+	vy_log_prepare_run(index->index_def->opts.lsn, run->id);
+	if (vy_log_tx_commit() < 0) {
 		vy_run_delete(run);
 		return -1;
 	}
@@ -1601,9 +1601,9 @@ vy_range_discard_new_run(struct vy_range *range)
 		     {say_error("error injection: run %lld not discarded",
 				(long long)run_id); return;});
 
-	xctl_tx_begin();
-	xctl_delete_vy_run(run_id);
-	if (xctl_tx_commit() < 0) {
+	vy_log_tx_begin();
+	vy_log_delete_run(run_id);
+	if (vy_log_tx_commit() < 0) {
 		/*
 		 * Failure to log deletion of an incomplete
 		 * run means that we won't retry to delete
@@ -2707,7 +2707,7 @@ vy_range_new(struct vy_index *index, int64_t id,
 	if (range->mem == NULL)
 		goto fail_mem;
 	/* Allocate a new id unless specified. */
-	range->id = (id >= 0 ? id : xctl_next_vy_range_id());
+	range->id = (id >= 0 ? id : vy_log_next_range_id());
 	if (begin != NULL) {
 		range->begin = vy_key_dup(begin);
 		if (range->begin == NULL)
@@ -3266,16 +3266,16 @@ vy_range_maybe_coalesce(struct vy_range **p_range)
 	/*
 	 * Log change in metadata.
 	 */
-	xctl_tx_begin();
-	xctl_insert_vy_range(index->index_def->opts.lsn, result->id,
-			     result->begin, result->end);
+	vy_log_tx_begin();
+	vy_log_insert_range(index->index_def->opts.lsn, result->id,
+			    result->begin, result->end);
 	for (it = first; it != end; it = vy_range_tree_next(&index->tree, it)) {
 		struct vy_run *run;
 		rlist_foreach_entry(run, &it->runs, in_range)
-			xctl_insert_vy_run(result->id, run->id);
-		xctl_delete_vy_range(it->id);
+			vy_log_insert_run(result->id, run->id);
+		vy_log_delete_range(it->id);
 	}
-	if (xctl_tx_commit() < 0)
+	if (vy_log_tx_commit() < 0)
 		goto fail_commit;
 
 	/*
@@ -3373,12 +3373,12 @@ vy_index_create(struct vy_index *index)
 	/*
 	 * Log change in metadata.
 	 */
-	xctl_tx_begin();
-	xctl_create_vy_index(index_def->opts.lsn, index_def->iid,
-			     index_def->space_id, index_def->opts.path);
-	xctl_insert_vy_range(index->index_def->opts.lsn,
-			     range->id, NULL, NULL);
-	if (xctl_tx_commit() < 0)
+	vy_log_tx_begin();
+	vy_log_create_index(index_def->opts.lsn, index_def->iid,
+			    index_def->space_id, index_def->opts.path);
+	vy_log_insert_range(index->index_def->opts.lsn,
+			    range->id, NULL, NULL);
+	if (vy_log_tx_commit() < 0)
 		return -1;
 
 	return 0;
@@ -3425,9 +3425,9 @@ struct vy_index_recovery_cb_arg {
 	struct vy_range *range;
 };
 
-/** Index recovery callback, passed to xctl_recover_index(). */
+/** Index recovery callback, passed to vy_log_recover_index(). */
 static int
-vy_index_recovery_cb(const struct xctl_record *record, void *cb_arg)
+vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 {
 	struct vy_index_recovery_cb_arg *arg = cb_arg;
 	struct vy_index *index = arg->index;
@@ -3436,16 +3436,16 @@ vy_index_recovery_cb(const struct xctl_record *record, void *cb_arg)
 	struct vy_run *run;
 
 	switch (record->type) {
-	case XCTL_CREATE_VY_INDEX:
-		assert(record->vy_index_id == index->index_def->opts.lsn);
+	case VY_LOG_CREATE_INDEX:
+		assert(record->index_id == index->index_def->opts.lsn);
 		break;
-	case XCTL_DROP_VY_INDEX:
+	case VY_LOG_DROP_INDEX:
 		index->is_dropped = true;
 		break;
-	case XCTL_INSERT_VY_RANGE:
-		range = vy_range_new(index, record->vy_range_id,
-				     record->vy_range_begin,
-				     record->vy_range_end);
+	case VY_LOG_INSERT_RANGE:
+		range = vy_range_new(index, record->range_id,
+				     record->range_begin,
+				     record->range_end);
 		if (range == NULL)
 			return -1;
 		if (range->begin != NULL && range->end != NULL &&
@@ -3456,10 +3456,10 @@ vy_index_recovery_cb(const struct xctl_record *record, void *cb_arg)
 		vy_index_add_range(index, range);
 		arg->range = range;
 		break;
-	case XCTL_INSERT_VY_RUN:
+	case VY_LOG_INSERT_RUN:
 		assert(range != NULL);
-		assert(range->id == record->vy_range_id);
-		run = vy_run_new(record->vy_run_id);
+		assert(range->id == record->range_id);
+		run = vy_run_new(record->run_id);
 		if (run == NULL)
 			return -1;
 		if (vy_run_recover(run, index->path) != 0) {
@@ -3480,8 +3480,8 @@ vy_index_open_ex(struct vy_index *index)
 	struct vy_env *env = index->env;
 
 	struct vy_index_recovery_cb_arg arg = { .index = index };
-	if (xctl_recover_vy_index(index->index_def->opts.lsn,
-				  vy_index_recovery_cb, &arg) != 0)
+	if (vy_log_recover_index(index->index_def->opts.lsn,
+				 vy_index_recovery_cb, &arg) != 0)
 		return -1;
 
 	/*
@@ -3893,9 +3893,9 @@ vy_task_dump_complete(struct vy_task *task)
 	 * Log change in metadata.
 	 */
 	if (!vy_run_is_empty(range->new_run)) {
-		xctl_tx_begin();
-		xctl_insert_vy_run(range->id, range->new_run->id);
-		if (xctl_tx_commit() < 0)
+		vy_log_tx_begin();
+		vy_log_insert_run(range->id, range->new_run->id);
+		if (vy_log_tx_commit() < 0)
 			return -1;
 	} else
 		vy_range_discard_new_run(range);
@@ -4058,15 +4058,15 @@ vy_task_split_complete(struct vy_task *task)
 	/*
 	 * Log change in metadata.
 	 */
-	xctl_tx_begin();
-	xctl_delete_vy_range(range->id);
+	vy_log_tx_begin();
+	vy_log_delete_range(range->id);
 	rlist_foreach_entry(r, &range->split_list, split_list) {
-		xctl_insert_vy_range(index->index_def->opts.lsn, r->id,
-				     r->begin, r->end);
+		vy_log_insert_range(index->index_def->opts.lsn, r->id,
+				    r->begin, r->end);
 		if (!vy_run_is_empty(r->new_run))
-			xctl_insert_vy_run(r->id, r->new_run->id);
+			vy_log_insert_run(r->id, r->new_run->id);
 	}
-	if (xctl_tx_commit() < 0)
+	if (vy_log_tx_commit() < 0)
 		return -1;
 
 	rlist_foreach_entry(r, &range->split_list, split_list) {
@@ -4298,17 +4298,17 @@ vy_task_compact_complete(struct vy_task *task)
 	/*
 	 * Log change in metadata.
 	 */
-	xctl_tx_begin();
+	vy_log_tx_begin();
 	n = range->compact_priority;
 	rlist_foreach_entry(run, &range->runs, in_range) {
-		xctl_delete_vy_run(run->id);
+		vy_log_delete_run(run->id);
 		if (--n == 0)
 			break;
 	}
 	assert(n == 0);
 	if (!vy_run_is_empty(range->new_run))
-		xctl_insert_vy_run(range->id, range->new_run->id);
-	if (xctl_tx_commit() < 0)
+		vy_log_insert_run(range->id, range->new_run->id);
+	if (vy_log_tx_commit() < 0)
 		return -1;
 
 	if (vy_run_is_empty(range->new_run))
@@ -5160,7 +5160,7 @@ vy_wait_checkpoint(struct vy_env *env, struct vclock *vclock)
 		goto error;
 	}
 
-	if (xctl_rotate(vclock) != 0)
+	if (vy_log_rotate(vclock) != 0)
 		goto error;
 
 	say_info("vinyl checkpoint done");
@@ -5550,9 +5550,9 @@ vy_index_drop(struct vy_index *index)
 	if (env->status == VINYL_FINAL_RECOVERY_LOCAL && was_dropped)
 		return;
 
-	xctl_tx_begin();
-	xctl_drop_vy_index(index_id);
-	if (xctl_tx_try_commit() < 0)
+	vy_log_tx_begin();
+	vy_log_drop_index(index_id);
+	if (vy_log_tx_try_commit() < 0)
 		say_warn("failed to log drop index: %s",
 			 diag_last_error(diag_get())->errmsg);
 }
@@ -7270,7 +7270,7 @@ vy_env_new(void)
 	ev_timer_start(loop(), &e->quota_timer);
 	vy_cache_env_create(&e->cache_env, slab_cache,
 			    e->conf->cache);
-	xctl_init();
+	vy_log_init();
 	return e;
 error_key_format:
 	vy_squash_queue_delete(e->squash_queue);
@@ -7305,7 +7305,7 @@ vy_env_delete(struct vy_env *e)
 	lsregion_destroy(&e->allocator);
 	tt_pthread_key_delete(e->zdctx_key);
 	vy_cache_env_destroy(&e->cache_env);
-	xctl_free();
+	vy_log_free();
 	TRASH(e);
 	free(e);
 }
@@ -7320,7 +7320,7 @@ vy_bootstrap(struct vy_env *e)
 	assert(e->status == VINYL_OFFLINE);
 	e->status = VINYL_ONLINE;
 	vy_quota_set_limit(&e->quota, e->conf->memory_limit);
-	if (xctl_bootstrap() != 0)
+	if (vy_log_bootstrap() != 0)
 		return -1;
 	return 0;
 }
@@ -7332,13 +7332,13 @@ vy_begin_initial_recovery(struct vy_env *e, struct vclock *vclock)
 	if (vclock != NULL) {
 		e->xm->lsn = vclock_sum(vclock);
 		e->status = VINYL_INITIAL_RECOVERY_LOCAL;
-		if (xctl_begin_recovery(vclock) != 0)
+		if (vy_log_begin_recovery(vclock) != 0)
 			return -1;
 	} else {
 		e->xm->lsn = 0;
 		e->status = VINYL_INITIAL_RECOVERY_REMOTE;
 		vy_quota_set_limit(&e->quota, e->conf->memory_limit);
-		if (xctl_bootstrap() != 0)
+		if (vy_log_bootstrap() != 0)
 			return -1;
 	}
 	return 0;
@@ -7366,7 +7366,7 @@ vy_end_recovery(struct vy_env *e)
 	switch (e->status) {
 	case VINYL_FINAL_RECOVERY_LOCAL:
 		vy_quota_set_limit(&e->quota, e->conf->memory_limit);
-		if (xctl_end_recovery() != 0)
+		if (vy_log_end_recovery() != 0)
 			return -1;
 		break;
 	case VINYL_FINAL_RECOVERY_REMOTE:
@@ -10074,14 +10074,14 @@ struct vy_join_arg {
 	int64_t lsn;
 };
 
-/** Relay callback, passed to xctl_relay(). */
+/** Relay callback, passed to vy_log_relay(). */
 static int
-vy_join_cb(const struct xctl_record *record, void *cb_arg)
+vy_join_cb(const struct vy_log_record *record, void *cb_arg)
 {
 	struct vy_join_arg *arg = cb_arg;
 	int rc = 0;
 
-	if (record->type == XCTL_CREATE_VY_INDEX) {
+	if (record->type == VY_LOG_CREATE_INDEX) {
 		arg->space_id = record->space_id;
 		arg->index_id = record->iid;
 		vy_index_snprint_path(arg->index_path, PATH_MAX,
@@ -10100,13 +10100,13 @@ vy_join_cb(const struct xctl_record *record, void *cb_arg)
 	 * We only send statements, not metadata, because the
 	 * latter is a replica's private business.
 	 */
-	if (record->type != XCTL_INSERT_VY_RUN)
+	if (record->type != VY_LOG_INSERT_RUN)
 		goto out;
 
 	rc = -1;
 
 	/* Load the run. */
-	struct vy_run *run = vy_run_new(record->vy_run_id);
+	struct vy_run *run = vy_run_new(record->run_id);
 	if (run == NULL)
 		goto out;
 	if (vy_run_recover(run, arg->index_path) != 0)
@@ -10158,7 +10158,7 @@ vy_join(struct vy_env *env, struct xstream *stream)
 		diag_set(OutOfMemory, PATH_MAX, "malloc", "path");
 		return -1;
 	}
-	int rc = xctl_relay(vy_join_cb, &arg);
+	int rc = vy_log_relay(vy_join_cb, &arg);
 	free(arg.index_path);
 	return rc;
 }
@@ -10169,14 +10169,14 @@ void
 vy_collect_garbage(struct vy_env *env, int64_t lsn)
 {
 	(void)env;
-	xctl_collect_garbage(lsn);
+	vy_log_collect_garbage(lsn);
 }
 
 int
 vy_backup(struct vy_env *env, int (*cb)(const char *, void *), void *cb_arg)
 {
 	(void)env;
-	return xctl_backup(cb, cb_arg);
+	return vy_log_backup(cb, cb_arg);
 }
 
 /**
