@@ -104,6 +104,10 @@ space:insert{tonumber64(5)}
 space:auto_increment{'b'}
 space:auto_increment{'c'}
 
+-- gh-2258: Incomprehensive failure of auto_increment in absence of indices
+space.index.primary:drop()
+space:auto_increment{'a'}
+
 space:drop()
 
 --
