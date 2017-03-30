@@ -633,7 +633,7 @@ local function stop()
     end
 
     local rv = base_stop()
-    if fio.stat(pid_file) then
+    if rv == 1 and fio.stat(pid_file) then
         fio.unlink(pid_file)
     end
     local console_sock = uri.parse(console_sock).service
