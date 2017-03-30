@@ -138,6 +138,7 @@ enum opt_type {
 	OPT_INT,	/* int64_t */
 	OPT_FLOAT,	/* double */
 	OPT_STR,	/* char[] */
+	OPT_STRPTR, /* char*, size_t */
 	opt_type_MAX,
 };
 
@@ -209,7 +210,8 @@ struct key_opts {
 	 * SQL statement that produced this index.
 	 * Currently unused (hence the minimal size).
 	 */
-	char sql[1];
+	const char *sql;
+	size_t sql_length;
 };
 
 extern const struct key_opts key_opts_default;
@@ -360,9 +362,9 @@ struct space_opts {
 	bool temporary;
 	/**
 	 * SQL statement that produced this space.
-	 * Currently unused, hence the minimal size.
 	 */
-	char sql[1];
+	const char *sql;
+	size_t sql_length;
 };
 
 extern const struct space_opts space_opts_default;
