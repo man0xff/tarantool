@@ -10147,8 +10147,9 @@ out:
 }
 
 int
-vy_join(struct vy_env *env, struct xstream *stream)
+vy_join(struct vy_env *env, struct vclock *vclock, struct xstream *stream)
 {
+	(void)vclock;
 	struct vy_join_arg arg = {
 		.env = env,
 		.stream = stream,
@@ -10173,9 +10174,11 @@ vy_collect_garbage(struct vy_env *env, int64_t lsn)
 }
 
 int
-vy_backup(struct vy_env *env, int (*cb)(const char *, void *), void *cb_arg)
+vy_backup(struct vy_env *env, struct vclock *vclock,
+	  int (*cb)(const char *, void *), void *cb_arg)
 {
 	(void)env;
+	(void)vclock;
 	return vy_log_backup(cb, cb_arg);
 }
 
