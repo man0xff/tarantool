@@ -1,0 +1,65 @@
+#!/usr/bin/env ./src/tarantool
+
+fiber = require('fiber')
+
+function cleanup()
+    os.execute("rm -rf *.snap *.xlog* *.vymeta* *.xctl* *.vylog* 512 513 514 515 ")
+    fiber.sleep(.1)
+end
+
+cleanup()
+
+box.cfg {
+    listen = '0.0.0.0:33013',
+    slab_alloc_arena = 4,
+    slab_alloc_factor = 1.1,
+    --slab_alloc_minimal = 16,
+    --slab_alloc_maximal = 10000000,
+    wal_mode = "write",
+    rows_per_wal = 500000,
+    log_level = 5,
+    vinyl_threads = 3;
+    vinyl_memory = 512 * 1024;
+    vinyl_range_size = 10 * 64;
+    vinyl_page_size = 64;
+    vinyl_cache = 1 * 1024 * 1024;
+}
+
+s = box.schema.space.create('test', {engine = 'vinyl', if_not_exists = true})
+i1 = s:create_index('test', {parts = {1, 'uint'}, if_not_exists = true})
+
+i = i1
+
+box.schema.user.grant('guest', 'read, write, execute', 'universe', {if_not_exists = true})
+
+n = 10
+m = 10
+ch = fiber.channel(m)
+
+function stest(l, m, n)
+    for i = 0, n - 1 do
+        s:insert({i * m + l, 'tuple ' .. tostring(i * m + l)})
+    end
+    ch:put(1)
+end;
+
+for i = 0, m - 1 do f = fiber.create(stest, i, m, n) end
+
+cnt = 0
+start_time = fiber.time()
+for i = 0, m - 1 do
+    tm = start_time + 2 - fiber.time()
+    if tm < 0 then
+      tm = 0
+    end
+    cnt = cnt + (ch:get(tm) or 0)
+end;
+
+--{{{ Tail
+
+os.exit(0)
+
+cleanup()
+
+--}}} Tail
+

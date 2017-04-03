@@ -7173,6 +7173,7 @@ int
 vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 {
 	assert(tx->state == VINYL_TX_COMMIT);
+	printf("%s lsn=%ld e->xm->lsn=%ld\n", __func__, lsn, e->xm->lsn);
 	if (lsn > e->xm->lsn)
 		e->xm->lsn = lsn;
 

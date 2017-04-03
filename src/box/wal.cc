@@ -752,6 +752,9 @@ wal_write(struct journal *journal, struct journal_entry *entry)
 	/* Promote replica set vclock with local writes. */
 	if (last->replica_id == instance_id)
 		vclock_follow(&replicaset_vclock, instance_id, last->lsn);
+
+	printf("%s entry->res=%ld\n", __func__, entry->res);
+
 	return entry->res;
 }
 
