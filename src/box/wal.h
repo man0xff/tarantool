@@ -103,21 +103,6 @@ wal_checkpoint(struct vclock *vclock, bool rotate);
 void
 wal_collect_garbage(int64_t lsn);
 
-void
-wal_init_vy_log();
-
-/**
- * Write xrows to the vinyl metadata log.
- */
-int
-wal_write_vy_log(struct journal_entry *req);
-
-/**
- * Rotate the vinyl metadata log.
- */
-void
-wal_rotate_vy_log();
-
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */

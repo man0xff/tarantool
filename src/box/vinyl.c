@@ -10240,7 +10240,7 @@ vy_join(struct vy_env *env, struct vclock *vclock, struct xstream *stream)
 		goto err_path;
 	}
 
-	arg.recovery = vy_recovery_new(vclock_sum(vclock));
+	arg.recovery = vy_log_load(vclock_sum(vclock));
 	if (arg.recovery == NULL)
 		goto err_recovery;
 
@@ -10286,7 +10286,7 @@ vy_collect_garbage(struct vy_env *env, int64_t lsn)
 	vy_log_collect_garbage(lsn);
 
 	/* Cleanup run files. */
-	struct vy_recovery *recovery = vy_recovery_new(lsn);
+	struct vy_recovery *recovery = vy_log_load(lsn);
 	if (recovery == NULL) {
 		say_warn("vinyl garbage collection failed: %s",
 			 diag_last_error(diag_get())->errmsg);
@@ -10343,7 +10343,7 @@ vy_backup(struct vy_env *env, struct vclock *vclock,
 		return -1;
 
 	/* Backup run files. */
-	struct vy_recovery *recovery = vy_recovery_new(vclock_sum(vclock));
+	struct vy_recovery *recovery = vy_log_load(vclock_sum(vclock));
 	if (recovery == NULL)
 		return -1;
 	struct vy_backup_arg arg = {

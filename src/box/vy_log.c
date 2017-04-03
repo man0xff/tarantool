@@ -32,6 +32,7 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -43,7 +44,7 @@
 #include <small/rlist.h>
 
 #include "assoc.h"
-#include "coeio.h"
+#include "cbus.h"
 #include "diag.h"
 #include "errcode.h"
 #include "fiber.h"
@@ -52,7 +53,6 @@
 #include "replication.h" /* INSTANCE_UUID */
 #include "say.h"
 #include "trivia/util.h"
-#include "wal.h"
 #include "vclock.h"
 #include "xlog.h"
 #include "xrow.h"
@@ -119,8 +119,6 @@ static const char *vy_log_type_name[] = {
 	[VY_LOG_FORGET_RUN]		= "forget_run",
 };
 
-struct vy_recovery;
-
 /**
  * Max number of records in the log buffer.
  * This limits the size of a transaction.
@@ -131,6 +129,8 @@ enum { VY_LOG_TX_BUF_SIZE = 64 };
 struct vy_log {
 	/** The directory where log files are stored. */
 	struct xdir dir;
+	/** Current metdata log file. */
+	struct xlog xlog;
 	/** Last checkpoint vclock. */
 	struct vclock last_checkpoint;
 	/** Next to last checkpoint vclock. */
@@ -139,6 +139,12 @@ struct vy_log {
 	struct vy_recovery *recovery;
 	/** Latch protecting the log buffer. */
 	struct latch latch;
+	/** IO thread. Used for reading and writing xlogs. */
+	struct cord io_cord;
+	/** Pipe from TX to IO thread. */
+	struct cpipe io_pipe;
+	/** Pipe from IO to TX thread. */
+	struct cpipe tx_pipe;
 	/**
 	 * Next ID to use for a vinyl range.
 	 * Used by vy_log_next_range_id().
@@ -256,6 +262,9 @@ struct vy_run_recovery_info {
 	 */
 	int64_t signature;
 };
+
+static struct vy_recovery *
+vy_recovery_new(struct xdir *dir, int64_t recovery_signature);
 
 /** An snprint-style function to print a log record. */
 static int
@@ -560,12 +569,88 @@ fail:
 	return -1;
 }
 
+/** IO thread function. */
+static int
+vy_log_io_f(va_list ap)
+{
+	(void)ap;
+
+	struct cbus_endpoint endpoint;
+	cbus_endpoint_create(&endpoint, "vylog", fiber_schedule_cb, fiber());
+
+	cpipe_create(&vy_log.tx_pipe, "tx");
+
+	cbus_loop(&endpoint);
+
+	if (xlog_is_open(&vy_log.xlog))
+		xlog_close(&vy_log.xlog, false);
+	return 0;
+}
+
 void
 vy_log_init(const char *dir)
 {
 	xdir_create(&vy_log.dir, dir, VYLOG, &INSTANCE_UUID);
+	xlog_clear(&vy_log.xlog);
 	latch_create(&vy_log.latch);
-	wal_init_vy_log();
+
+	if (cord_costart(&vy_log.io_cord, "vylog", vy_log_io_f, NULL) != 0)
+		panic("vinyl: failed to start log thread");
+
+	cpipe_create(&vy_log.io_pipe, "vylog");
+}
+
+static int
+vy_log_flush_f(struct cbus_call_msg *cmsg)
+{
+	(void)cmsg;
+
+	struct xlog *xlog = &vy_log.xlog;
+
+	if (!xlog_is_open(xlog)) {
+		char *path = xdir_format_filename(&vy_log.dir,
+				vclock_sum(&vy_log.last_checkpoint), NONE);
+		if (xlog_open(xlog, path) < 0)
+			return -1;
+	}
+
+	xlog_tx_begin(xlog);
+	for (int i = 0; i < vy_log.tx_end; i++) {
+		struct xrow_header row;
+		if (vy_log_record_encode(&vy_log.tx_buf[i], &row) < 0 ||
+		    xlog_write_row(xlog, &row) < 0)
+			return -1;
+	}
+	if (xlog_tx_commit(xlog) < 0 ||
+	    xlog_flush(xlog) < 0)
+		return -1;
+
+	return 0;
+}
+
+static int
+vy_log_flush_locked(void)
+{
+	assert(latch_owner(&vy_log.latch) == fiber());
+
+	if (vy_log.tx_end == 0)
+		return 0; /* nothing to do */
+
+	/*
+	 * Do actual disk writes on behalf of the IO thread
+	 * so as not to block the tx thread.
+	 */
+	struct cbus_call_msg msg;
+	bool cancellable = fiber_set_cancellable(false);
+	int rc = cbus_call(&vy_log.io_pipe, &vy_log.tx_pipe, &msg,
+			   vy_log_flush_f, NULL, TIMEOUT_INFINITY);
+	fiber_set_cancellable(cancellable);
+	if (rc < 0)
+		return -1;
+
+	/* Success. Reset the buffer. */
+	vy_log.tx_end = 0;
+	return 0;
 }
 
 /**
@@ -578,54 +663,20 @@ vy_log_init(const char *dir)
 static int
 vy_log_flush(void)
 {
-	if (vy_log.tx_end == 0)
-		return 0; /* nothing to do */
-
-	struct journal_entry *entry = journal_entry_new(vy_log.tx_end);
-	if (entry == NULL)
-		return -1;
-
-	struct xrow_header *rows;
-	rows = region_aligned_alloc(&fiber()->gc,
-				    vy_log.tx_end * sizeof(struct xrow_header),
-				    alignof(struct xrow_header));
-	if (rows == NULL)
-		return -1;
-
-	/*
-	 * Encode buffered records.
-	 */
-	for (int i = 0; i < vy_log.tx_end; i++) {
-		struct xrow_header *row = &rows[i];
-		if (vy_log_record_encode(&vy_log.tx_buf[i], row) < 0)
-			return -1;
-		entry->rows[i] = row;
-	}
-	/*
-	 * Do actual disk writes on behalf of the WAL
-	 * so as not to block the tx thread.
-	 */
-	if (wal_write_vy_log(entry) != 0)
-		return -1;
-
-	/* Success. Reset the buffer. */
-	vy_log.tx_end = 0;
-	return 0;
+	latch_lock(&vy_log.latch);
+	int rc = vy_log_flush_locked();
+	latch_unlock(&vy_log.latch);
+	return rc;
 }
 
 void
 vy_log_free(void)
 {
+	cbus_stop_loop(&vy_log.io_pipe);
+	if (cord_join(&vy_log.io_cord))
+		panic_syserror("vinyl: failed to join log thread");
 	xdir_destroy(&vy_log.dir);
 	latch_destroy(&vy_log.latch);
-}
-
-int
-vy_log_open(struct xlog *xlog)
-{
-	char *path = xdir_format_filename(&vy_log.dir,
-			vclock_sum(&vy_log.last_checkpoint), NONE);
-	return xlog_open(xlog, path);
 }
 
 int64_t
@@ -685,7 +736,7 @@ vy_log_begin_recovery(const struct vclock *vclock)
 	}
 
 	struct vy_recovery *recovery;
-	recovery = vy_recovery_new(INT64_MAX);
+	recovery = vy_recovery_new(&vy_log.dir, INT64_MAX);
 	if (recovery == NULL)
 		return NULL;
 
@@ -787,12 +838,37 @@ err_create_xlog:
 	return -1;
 }
 
-static ssize_t
-vy_log_rotate_f(va_list ap)
+struct vy_log_rotate_msg {
+	struct cbus_call_msg cmsg;
+	struct vclock *vclock;
+};
+
+static int
+vy_log_rotate_f(struct cbus_call_msg *cmsg)
 {
-	struct vy_recovery *recovery = va_arg(ap, struct vy_recovery *);
-	const struct vclock *vclock = va_arg(ap, const struct vclock *);
-	return vy_log_create(vclock, recovery);
+	struct vy_log_rotate_msg *msg = container_of(cmsg,
+			struct vy_log_rotate_msg, cmsg);
+
+	struct vy_recovery *recovery;
+	recovery = vy_recovery_new(&vy_log.dir, vclock_sum(msg->vclock));
+	if (recovery == NULL)
+		return -1;
+
+	int rc = vy_log_create(msg->vclock, recovery);
+	vy_recovery_delete(recovery);
+
+	if (rc != 0)
+		return -1;
+	/*
+	 * Success. Close the old log. The new one will be opened
+	 * automatically on the first write (see vy_log_flush()).
+	 */
+	if (xlog_is_open(&vy_log.xlog))
+		xlog_close(&vy_log.xlog, false);
+
+	/* Add the new vclock to the xdir so that we can track it. */
+	xdir_add_vclock(&vy_log.dir, msg->vclock);
+	return 0;
 }
 
 int
@@ -820,12 +896,17 @@ vy_log_rotate(const struct vclock *vclock)
 	say_debug("%s: signature %lld", __func__,
 		  (long long)vclock_sum(vclock));
 
-	struct vy_recovery *recovery = vy_recovery_new(INT64_MAX);
-	if (recovery == NULL)
+	/*
+	 * To make sure that all pending records get to the new
+	 * version of the log, we need to flush them.
+	 */
+	int rc = vy_log_flush();
+	if (rc != 0)
 		goto fail;
 
 	/*
-	 * Lock out all concurrent log writers while we are rotating it.
+	 * Since all writes go through the IO thread, we lock out all
+	 * concurrent writers by handing rotation work to the IO thread.
 	 * This effectively stalls the vinyl scheduler for a while, but
 	 * this is acceptable, because (1) the log file is small and
 	 * hence can be rotated fairly quickly so the stall isn't going
@@ -833,31 +914,20 @@ vy_log_rotate(const struct vclock *vclock)
 	 * by the scheduler, are rare events so there shouldn't be too
 	 * many of them piling up due to log rotation.
 	 */
-	latch_lock(&vy_log.latch);
+	struct vy_log_rotate_msg msg = { .vclock = new_vclock };
+	bool cancellable = fiber_set_cancellable(false);
+	rc = cbus_call(&vy_log.io_pipe, &vy_log.tx_pipe, &msg.cmsg,
+		       vy_log_rotate_f, NULL, TIMEOUT_INFINITY);
+	fiber_set_cancellable(cancellable);
 
-	/* Do actual work from coeio so as not to stall tx thread. */
-	int rc = coio_call(vy_log_rotate_f, recovery, vclock);
-	vy_recovery_delete(recovery);
-	if (rc < 0) {
-		latch_unlock(&vy_log.latch);
+	if (rc != 0)
 		goto fail;
-	}
 
-	/*
-	 * Success. Close the old log. The new one will be opened
-	 * automatically on the first write (see wal_write_vy_log()).
-	 */
-	wal_rotate_vy_log();
 	vclock_copy(&vy_log.prev_checkpoint, &vy_log.last_checkpoint);
 	vclock_copy(&vy_log.last_checkpoint, vclock);
 
-	/* Add the new vclock to the xdir so that we can track it. */
-	xdir_add_vclock(&vy_log.dir, new_vclock);
-
-	latch_unlock(&vy_log.latch);
 	say_debug("%s: complete", __func__);
 	return 0;
-
 fail:
 	say_debug("%s: failed", __func__);
 	say_error("failed to rotate metadata log: %s",
@@ -866,11 +936,17 @@ fail:
 	return -1;
 }
 
-static ssize_t
-vy_log_collect_garbage_f(va_list ap)
+struct vy_log_gc_msg {
+	struct cbus_call_msg cmsg;
+	int64_t signature;
+};
+
+static int
+vy_log_collect_garbage_f(struct cbus_call_msg *cmsg)
 {
-	int64_t signature = va_arg(ap, int64_t);
-	xdir_collect_garbage(&vy_log.dir, signature);
+	struct vy_log_gc_msg *msg = container_of(cmsg,
+			struct vy_log_gc_msg, cmsg);
+	xdir_collect_garbage(&vy_log.dir, msg->signature);
 	return 0;
 }
 
@@ -882,7 +958,12 @@ vy_log_collect_garbage(int64_t signature)
 	 * it is still needed for backups.
 	 */
 	signature = MIN(signature, vclock_sum(&vy_log.prev_checkpoint));
-	coio_call(vy_log_collect_garbage_f, signature);
+
+	struct vy_log_gc_msg msg = { .signature = signature };
+	bool cancellable = fiber_set_cancellable(false);
+	cbus_call(&vy_log.io_pipe, &vy_log.tx_pipe, &msg.cmsg,
+		  vy_log_collect_garbage_f, NULL, TIMEOUT_INFINITY);
+	fiber_set_cancellable(cancellable);
 }
 
 const char *
@@ -900,6 +981,41 @@ vy_log_backup_path(struct vclock *vclock)
 		return NULL;
 	}
 	return xdir_format_filename(&vy_log.dir, vclock_sum(prev), NONE);
+}
+
+struct vy_log_load_msg {
+	struct cbus_call_msg cmsg;
+	int64_t recovery_signature;
+	struct vy_recovery *recovery;
+};
+
+static int
+vy_log_load_f(struct cbus_call_msg *cmsg)
+{
+	struct vy_log_load_msg *msg = container_of(cmsg,
+			struct vy_log_load_msg, cmsg);
+	msg->recovery = vy_recovery_new(&vy_log.dir, msg->recovery_signature);
+	return 0;
+}
+
+struct vy_recovery *
+vy_log_load(int64_t recovery_signature)
+{
+	/*
+	 * Before proceeding to log recovery, make sure that all
+	 * pending records have been flushed out.
+	 */
+	if (vy_log_flush() != 0)
+		return NULL;
+
+	struct vy_log_load_msg msg = {
+		.recovery_signature = recovery_signature,
+	};
+	bool cancellable = fiber_set_cancellable(false);
+	cbus_call(&vy_log.io_pipe, &vy_log.tx_pipe, &msg.cmsg,
+		  vy_log_load_f, NULL, TIMEOUT_INFINITY);
+	fiber_set_cancellable(cancellable);
+	return msg.recovery;
 }
 
 void
@@ -932,7 +1048,7 @@ vy_log_tx_do_commit(bool no_discard)
 	if (vy_log.recovery != NULL)
 		goto out;
 
-	rc = vy_log_flush();
+	rc = vy_log_flush_locked();
 	/*
 	 * Rollback the transaction on failure unless
 	 * we were explicitly told not to.
@@ -1417,12 +1533,14 @@ vy_recovery_process_record(struct vy_recovery *recovery,
 	return rc;
 }
 
-static ssize_t
-vy_recovery_new_f(va_list ap)
+/**
+ * Load all records with signature < @recovery_signature
+ * from the newest version of the log stored in @dir.
+ * Return the recovery context on success, NULL on failure.
+ */
+static struct vy_recovery *
+vy_recovery_new(struct xdir *dir, int64_t recovery_signature)
 {
-	int64_t recovery_signature = va_arg(ap, int64_t);
-	struct vy_recovery **p_recovery = va_arg(ap, struct vy_recovery **);
-
 	struct vy_recovery *recovery = malloc(sizeof(*recovery));
 	if (recovery == NULL) {
 		diag_set(OutOfMemory, sizeof(*recovery),
@@ -1447,13 +1565,13 @@ vy_recovery_new_f(va_list ap)
 	}
 
 	struct vclock vclock;
-	if (xdir_last_vclock(&vy_log.dir, &vclock) < 0) {
+	if (xdir_last_vclock(dir, &vclock) < 0) {
 		/* No log file, nothing to do. */
 		goto out;
 	}
 
 	struct xlog_cursor cursor;
-	if (xdir_open_cursor(&vy_log.dir, vclock_sum(&vclock), &cursor) < 0)
+	if (xdir_open_cursor(dir, vclock_sum(&vclock), &cursor) < 0)
 		goto fail_free;
 
 	int rc;
@@ -1474,38 +1592,14 @@ vy_recovery_new_f(va_list ap)
 
 	xlog_cursor_close(&cursor, false);
 out:
-	*p_recovery = recovery;
-	return 0;
+	return recovery;
 
 fail_close:
 	xlog_cursor_close(&cursor, false);
 fail_free:
 	vy_recovery_delete(recovery);
 fail:
-	return -1;
-}
-
-struct vy_recovery *
-vy_recovery_new(int64_t recovery_signature)
-{
-	int rc;
-	struct vy_recovery *recovery;
-
-	/* Lock out concurrent writers while we are loading the log. */
-	latch_lock(&vy_log.latch);
-	/*
-	 * Before proceeding to log recovery, make sure that all
-	 * pending records have been flushed out.
-	 */
-	rc = vy_log_flush();
-	if (rc != 0)
-		goto out;
-
-	/* Load the log from coeio so as not to stall tx thread. */
-	rc = coio_call(vy_recovery_new_f, recovery_signature, &recovery);
-out:
-	latch_unlock(&vy_log.latch);
-	return rc == 0 ? recovery : NULL;
+	return NULL;
 }
 
 /** Helper to delete mh_i64ptr_t along with all its records. */

@@ -37,7 +37,6 @@
 
 #include "xlog.h"
 #include "xrow.h"
-#include "vy_log.h"
 #include "cbus.h"
 #include "coeio.h"
 #include "replication.h"
@@ -131,15 +130,6 @@ struct wal_msg: public cmsg {
 	struct stailq rollback;
 };
 
-/**
- * Vinyl metadata log writer.
- */
-struct vy_log_writer {
-	/** The metadata log file. */
-	struct xlog xlog;
-};
-
-static struct vy_log_writer vy_log_writer;
 static struct wal_thread wal_thread;
 static struct wal_writer wal_writer_singleton;
 
@@ -691,9 +681,6 @@ wal_thread_f(va_list ap)
 	if (xlog_is_open(&writer->current_wal))
 		xlog_close(&writer->current_wal, false);
 
-	if (xlog_is_open(&vy_log_writer.xlog))
-		xlog_close(&vy_log_writer.xlog, false);
-
 	cpipe_destroy(&wal_thread.tx_pipe);
 	return 0;
 }
@@ -787,68 +774,6 @@ wal_write_in_wal_mode_none(struct journal *journal,
 	return vclock_sum(&writer->vclock);
 }
 
-void
-wal_init_vy_log()
-{
-	xlog_clear(&vy_log_writer.xlog);
-}
-
-struct wal_write_vy_log_msg: public cbus_call_msg
-{
-	struct journal_entry *entry;
-};
-
-static int
-wal_write_vy_log_f(struct cbus_call_msg *msg)
-{
-	struct journal_entry *entry =
-		((struct wal_write_vy_log_msg *)msg)->entry;
-
-	if (! xlog_is_open(&vy_log_writer.xlog)) {
-		if (vy_log_open(&vy_log_writer.xlog) < 0)
-			return -1;
-	}
-
-	if (xlog_write_entry(&vy_log_writer.xlog, entry) < 0)
-		return -1;
-
-	if (xlog_flush(&vy_log_writer.xlog) < 0)
-		return -1;
-
-	return 0;
-}
-
-int
-wal_write_vy_log(struct journal_entry *entry)
-{
-	struct wal_write_vy_log_msg msg;
-	msg.entry= entry;
-	bool cancellable = fiber_set_cancellable(false);
-	int rc = cbus_call(&wal_thread.wal_pipe, &wal_thread.tx_pipe, &msg,
-			   wal_write_vy_log_f, NULL, TIMEOUT_INFINITY);
-	fiber_set_cancellable(cancellable);
-	return rc;
-}
-
-static int
-wal_rotate_vy_log_f(struct cbus_call_msg *msg)
-{
-	(void) msg;
-	if (xlog_is_open(&vy_log_writer.xlog))
-		xlog_close(&vy_log_writer.xlog, false);
-	return 0;
-}
-
-void
-wal_rotate_vy_log()
-{
-	struct cbus_call_msg msg;
-	bool cancellable = fiber_set_cancellable(false);
-	cbus_call(&wal_thread.wal_pipe, &wal_thread.tx_pipe, &msg,
-		  wal_rotate_vy_log_f, NULL, TIMEOUT_INFINITY);
-	fiber_set_cancellable(cancellable);
-}
-
 int
 wal_set_watcher(struct wal_watcher *watcher, struct ev_async *async)
 {
@@ -901,6 +826,4 @@ wal_atfork()
 {
 	if (xlog_is_open(&wal_writer_singleton.current_wal))
 		xlog_atfork(&wal_writer_singleton.current_wal);
-	if (xlog_is_open(&vy_log_writer.xlog))
-		xlog_atfork(&vy_log_writer.xlog);
 }

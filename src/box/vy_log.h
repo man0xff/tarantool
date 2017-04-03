@@ -176,12 +176,6 @@ void
 vy_log_free(void);
 
 /**
- * Open current vy_log file.
- */
-int
-vy_log_open(struct xlog *xlog);
-
-/**
  * Rotate the metadata log. This function creates a new
  * xlog file in the log directory having vclock @vclock
  * and writes records required to recover active indexes.
@@ -302,10 +296,10 @@ vy_log_end_recovery(void);
  * Returns NULL on failure.
  */
 struct vy_recovery *
-vy_recovery_new(int64_t recovery_signature);
+vy_log_load(int64_t recovery_signature);
 
 /**
- * Free a recovery context created by vy_recovery_new().
+ * Free a recovery context.
  */
 void
 vy_recovery_delete(struct vy_recovery *recovery);
