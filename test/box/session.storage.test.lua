@@ -9,12 +9,20 @@ session.unknown_field
 type(session.storage)
 session.storage.abc = 'cde'
 session.storage.abc
+fiber = require('fiber')
+function inc() conns = conns + 1 end
+function dec() conns = conns - 1 end
 
+type(session.on_connect(inc))
+type(session.on_disconnect(dec))
+conns = 0
 all = getmetatable(session).aggregate_storage
 all[session.id()].abc
 
 test_run:cmd("create connection second to default")
 test_run:cmd("set connection second")
+while conns < 3 do fiber.sleep(0.01) end
+conns
 
 type(session.storage)
 type(session.storage.abc)
@@ -22,7 +30,6 @@ session.storage.abc = 'def'
 session.storage.abc
 
 test_run:cmd("set connection default")
-
 session.storage.abc
 
 test_run:cmd("set connection second")
@@ -36,7 +43,7 @@ for k,v in pairs(all) do table.insert(tres1, v.abc) end
 
 test_run:cmd("drop connection default")
 test_run:cmd("drop connection second")
-require('fiber').sleep(.01)
+while conns > 1 do fiber.sleep(0.001) end
 for k,v in pairs(all) do table.insert(tres2, v.abc) end
 
 table.sort(tres1)
