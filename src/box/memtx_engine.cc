@@ -573,8 +573,6 @@ MemtxEngine::bootstrap()
 
 	/* Recover from bootstrap.snap */
 	say_info("initializing an empty data directory");
-	struct xdir dir;
-	xdir_create(&dir, "", SNAP, &uuid_nil);
 	struct xlog_cursor cursor;
 	if (xlog_cursor_openmem(&cursor, (const char *)bootstrap_bin,
 				sizeof(bootstrap_bin), "bootstrap") < 0) {
@@ -582,7 +580,6 @@ MemtxEngine::bootstrap()
 	};
 	auto guard = make_scoped_guard([&]{
 		xlog_cursor_close(&cursor, false);
-		xdir_destroy(&dir);
 	});
 
 	struct xrow_header row;
@@ -662,17 +659,17 @@ struct checkpoint {
 	bool waiting_for_snap_thread;
 	/** The vclock of the snapshot file. */
 	struct vclock *vclock;
-	struct xdir dir;
+	struct xdir *snap_dir;
 };
 
 static void
-checkpoint_init(struct checkpoint *ckpt, const char *snap_dirname,
+checkpoint_init(struct checkpoint *ckpt, struct xdir *snap_dir,
 		uint64_t snap_io_rate_limit)
 {
 	ckpt->entries = RLIST_HEAD_INITIALIZER(ckpt->entries);
 	ckpt->waiting_for_snap_thread = false;
-	xdir_create(&ckpt->dir, snap_dirname, SNAP, &INSTANCE_UUID);
 	ckpt->snap_io_rate_limit = snap_io_rate_limit;
+	ckpt->snap_dir = snap_dir;
 	/* May be used in abortCheckpoint() */
 	ckpt->vclock = (struct vclock *) malloc(sizeof(*ckpt->vclock));
 	if (ckpt->vclock == NULL)
@@ -691,7 +688,6 @@ checkpoint_destroy(struct checkpoint *ckpt)
 		entry->iterator->free(entry->iterator);
 	}
 	ckpt->entries = RLIST_HEAD_INITIALIZER(ckpt->entries);
-	xdir_destroy(&ckpt->dir);
 	free(ckpt->vclock);
 }
 
@@ -724,7 +720,7 @@ checkpoint_f(va_list ap)
 	struct checkpoint *ckpt = va_arg(ap, struct checkpoint *);
 
 	struct xlog snap;
-	if (xdir_create_xlog(&ckpt->dir, &snap, ckpt->vclock) != 0)
+	if (xdir_create_xlog(ckpt->snap_dir, &snap, ckpt->vclock) != 0)
 		diag_raise();
 
 	auto guard = make_scoped_guard([&]{ xlog_close(&snap, false); });
@@ -752,7 +748,7 @@ MemtxEngine::beginCheckpoint()
 
 	m_checkpoint = region_alloc_object_xc(&fiber()->gc, struct checkpoint);
 
-	checkpoint_init(m_checkpoint, m_snap_dir.dirname, m_snap_io_rate_limit);
+	checkpoint_init(m_checkpoint, &m_snap_dir, m_snap_io_rate_limit);
 	space_foreach(checkpoint_add_space, m_checkpoint);
 
 	/* increment snapshot version; set tuple deletion to delayed mode */
@@ -794,12 +790,11 @@ MemtxEngine::commitCheckpoint(struct vclock *vclock)
 	memtx_tuple_end_snapshot();
 
 	int64_t lsn = vclock_sum(m_checkpoint->vclock);
-	struct xdir *dir = &m_checkpoint->dir;
 	/* rename snapshot on completion */
 	char to[PATH_MAX];
 	snprintf(to, sizeof(to), "%s",
-		 xdir_format_filename(dir, lsn, NONE));
-	char *from = xdir_format_filename(dir, lsn, INPROGRESS);
+		 xdir_format_filename(&m_snap_dir, lsn, NONE));
+	char *from = xdir_format_filename(&m_snap_dir, lsn, INPROGRESS);
 	int rc = coeio_rename(from, to);
 	if (rc != 0)
 		panic("can't rename .snap.inprogress");
@@ -827,7 +822,7 @@ MemtxEngine::abortCheckpoint()
 
 	/** Remove garbage .inprogress file. */
 	char *filename =
-		xdir_format_filename(&m_checkpoint->dir,
+		xdir_format_filename(&m_snap_dir,
 				     vclock_sum(m_checkpoint->vclock),
 				     INPROGRESS);
 	(void) coeio_unlink(filename);
@@ -861,7 +856,7 @@ MemtxEngine::backup(struct vclock *vclock, engine_backup_cb cb, void *cb_arg)
 
 /** Used to pass arguments to memtx_initial_join_f */
 struct memtx_join_arg {
-	const char *snap_dirname;
+	struct xdir *snap_dir;
 	int64_t checkpoint_lsn;
 	struct xstream *stream;
 };
@@ -873,21 +868,12 @@ static int
 memtx_initial_join_f(va_list ap)
 {
 	struct memtx_join_arg *arg = va_arg(ap, struct memtx_join_arg *);
-	const char *snap_dirname = arg->snap_dirname;
+	struct xdir *snap_dir = arg->snap_dir;
 	int64_t checkpoint_lsn = arg->checkpoint_lsn;
 	struct xstream *stream = arg->stream;
 
-	struct xdir dir;
-	/*
-	 * snap_dirname and INSTANCE_UUID don't change after start,
-	 * safe to use in another thread.
-	 */
-	xdir_create(&dir, snap_dirname, SNAP, &INSTANCE_UUID);
-	auto guard = make_scoped_guard([&]{
-		xdir_destroy(&dir);
-	});
 	struct xlog_cursor cursor;
-	xdir_open_cursor_xc(&dir, checkpoint_lsn, &cursor);
+	xdir_open_cursor_xc(snap_dir, checkpoint_lsn, &cursor);
 	auto reader_guard = make_scoped_guard([&]{
 		xlog_cursor_close(&cursor, false);
 	});
@@ -916,7 +902,7 @@ MemtxEngine::join(struct vclock *vclock, struct xstream *stream)
 	 * cord_costart() passes only void * pointer as an argument.
 	 */
 	struct memtx_join_arg arg = {
-		/* .snap_dirname   = */ m_snap_dir.dirname,
+		/* .snap_dir       = */ &m_snap_dir,
 		/* .checkpoint_lsn = */ vclock_sum(vclock),
 		/* .stream         = */ stream
 	};
